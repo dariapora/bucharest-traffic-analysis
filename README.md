@@ -8,4 +8,4 @@ The dataset contains 10.4 million traffic observations distributed across 23,506
 
 Each observation records multiple speed-related metrics for a specific road segment during a 15-minute window. These include median speed, average speed, harmonic average speed, and the full speed distribution expressed as percentiles. The data also captures variability through standard deviation of speeds and travel time measurements.
 
-The Dataset is available on [Kaggle](https://www.kaggle.com/datasets/dariapora/bucharest-traffic-stats) and contains data obtained through TomTom's [Trafic Stats API](https://www.tomtom.com/products/traffic-stats/).
+The Dataset contains data obtained through TomTom's [Trafic Stats API](https://www.tomtom.com/products/traffic-stats/).
