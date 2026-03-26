@@ -1,6 +1,6 @@
 # Bucharest Traffic Analysis
 
-This project examines traffic flow across the Bucharest road network during August 25-31, 2024. The goal is to understand how traffic conditions vary across different road segments, times of day, and days of the week, providing a foundation for understanding urban mobility in Romania's capital.
+This project examines traffic flow across the Bucharest road network during August 25th-31st, 2024. The goal is to understand how traffic conditions vary across different road segments, times of day, and days of the week, providing a foundation for understanding urban mobility in Romania's capital.
 
 ## Dataset Overview
 
