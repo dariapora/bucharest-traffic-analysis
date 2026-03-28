@@ -67,6 +67,11 @@ for test_date in unique_dates:
     model.fit(train[features], train[target])
 
     preds = model.predict(test[features])
+    test["predicted_speed"] = preds
+    test["error"] = test["predicted_speed"] - test[target]
+
+
+    print(test[["street_name", "time_start", "average_speed", "predicted_speed", "error"]].head(20))
     mae = mean_absolute_error(test[target], preds)
     r2  = r2_score(test[target], preds)
     results.append({"held_out_day": str(test_date)[:10], "MAE": mae, "R2": r2})
