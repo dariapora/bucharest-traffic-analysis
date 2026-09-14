@@ -1,11 +1,9 @@
-from pathlib import Path
-import math
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
 
-from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
@@ -13,193 +11,72 @@ from sklearn.metrics import (
     f1_score
 )
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-csv_path = BASE_DIR / "data" / "reports" / "dataframe.csv"
+from features import (
+    REPORT_DIR,
+    STATE_ORDER,
+    FEATURE_COLS,
+    load_dataset,
+    add_features,
+    add_features_out_of_fold,
+)
 
-THRESHOLDS = {
-    "free_flow": 0.85,
-    "slow": 0.55
-}
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}")
 
-STATE_ORDER = [
-    "free_flow",
-    "slow",
-    "congested"
-]
-
-
-def ratio_to_label(sr):
-    if sr >= THRESHOLDS["free_flow"]:
-        return 0       #free_flow
-
-    elif sr >= THRESHOLDS["slow"]:
-        return 1       #moderate
-
-    else:
-        return 2       #congested
+N_CLASSES = 3
+MAX_ITER = 500
 
 
+def compute_class_weights(y, n_classes):
+    counts = np.bincount(y, minlength=n_classes)
+    weights = len(y) / (n_classes * np.maximum(counts, 1))
+    return torch.tensor(weights, dtype=torch.float32)
 
-def make_time_slot(df):
-    return (df["time_numeric"] * 4).round().astype(int) % 96
 
+def train_logistic_regression(X_train, y_train, n_classes=N_CLASSES, max_iter=MAX_ITER, seed=42):
+    torch.manual_seed(seed)
 
-def add_features(df, train_ref):
-    df = df.copy()
-    train_ref2 = train_ref.copy()
-    train_ref2["hour"] = train_ref2["time_numeric"].astype(int)
-    df["hour"] = df["time_numeric"].astype(int)
+    X = torch.tensor(X_train, dtype=torch.float32, device=DEVICE)
+    y = torch.tensor(y_train, dtype=torch.long, device=DEVICE)
 
-    # target-encode segment
-    seg_enc = (
-        train_ref.groupby("segment_id")["speed_ratio"]
-        .agg(segment_mean_speed="mean", segment_std_speed="std",
-             segment_min_speed="min", segment_q10_speed=lambda x: x.quantile(0.10))
-        .fillna(0)
+    class_weights = compute_class_weights(y_train, n_classes).to(DEVICE)
+
+    model = nn.Linear(X.shape[1], n_classes).to(DEVICE)
+    loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+
+    # full-batch L-BFGS: the problem is convex and fits on the GPU, so this
+    # converges to the optimum in a few hundred evaluations
+    optimizer = torch.optim.LBFGS(
+        model.parameters(),
+        lr=1.0,
+        max_iter=max_iter,
+        history_size=50,
+        tolerance_grad=1e-7,
+        tolerance_change=1e-10,
+        line_search_fn="strong_wolfe",
     )
-    df = df.join(seg_enc, on="segment_id")
 
-    # segment congestion rate (fraction of time in congested state)
-    seg_cong = (
-        (train_ref["speed_ratio"] < THRESHOLDS["slow"])
-        .groupby(train_ref["segment_id"]).mean()
-        .rename("segment_congestion_rate")
-    )
-    df = df.join(seg_cong, on="segment_id")
+    def closure():
+        optimizer.zero_grad()
+        loss = loss_fn(model(X), y)
+        loss.backward()
+        return loss
 
-    # segment slow rate (fraction of time in slow state)
-    seg_slow = (
-        ((train_ref["speed_ratio"] >= THRESHOLDS["slow"]) &
-         (train_ref["speed_ratio"] < THRESHOLDS["free_flow"]))
-        .groupby(train_ref["segment_id"]).mean()
-        .rename("segment_slow_rate")
-    )
-    df = df.join(seg_slow, on="segment_id")
+    model.train()
+    optimizer.step(closure)
 
-    # historical aggregates
-    for key, col in [
-        (["segment_id", "day_of_week_num"], "hist_seg_dow"),
-        (["segment_id", "is_weekend"],      "hist_seg_weekend"),
-        (["segment_id", "hour"],            "hist_seg_hour"),
-    ]:
-        agg = train_ref2.groupby(key)["speed_ratio"].mean().rename(col)
-        df = df.join(agg, on=key)
-
-    # segment-hour std: how variable is this segment at this hour?
-    hist_seg_hour_std = (
-        train_ref2.groupby(["segment_id", "hour"])["speed_ratio"]
-        .std().fillna(0).rename("hist_seg_hour_std")
-    )
-    df = df.join(hist_seg_hour_std, on=["segment_id", "hour"])
-
-    # segment-hour congestion rate
-    seg_hour_cong = (
-        (train_ref2["speed_ratio"] < THRESHOLDS["slow"])
-        .groupby([train_ref2["segment_id"], train_ref2["hour"]]).mean()
-        .rename("seg_hour_cong_rate")
-    )
-    df = df.join(seg_hour_cong, on=["segment_id", "hour"])
-
-    # segment-hour min and q25: worst-case behavior at this hour
-    seg_hour_extremes = (
-        train_ref2.groupby(["segment_id", "hour"])["speed_ratio"]
-        .agg(seg_hour_min="min", seg_hour_q25=lambda x: x.quantile(0.25))
-    )
-    df = df.join(seg_hour_extremes, on=["segment_id", "hour"])
-
-    global_hour = train_ref2.groupby("hour")["speed_ratio"].mean().rename("global_hour_mean")
-    df = df.join(global_hour, on="hour")
-
-    global_dow_hour = (
-        train_ref2.groupby(["day_of_week_num", "hour"])["speed_ratio"]
-        .mean().rename("global_dow_hour_mean")
-    )
-    df = df.join(global_dow_hour, on=["day_of_week_num", "hour"])
-
-    # ── deviation features ────────────────────────────────────────────────────
-    df["seg_vs_global_hour"] = df["hist_seg_hour"]  - df["global_hour_mean"]
-    df["seg_vs_global_dow"]  = df["hist_seg_dow"]   - df["global_dow_hour_mean"]
-
-    # ratio interaction: segment vs city at this hour
-    df["seg_hour_vs_city_ratio"] = df["hist_seg_hour"] / (df["global_hour_mean"] + 1e-6)
-
-    # ── road capacity proxy ───────────────────────────────────────────────────
-    df["road_capacity"] = df["frc"] * df["speed_limit"]
-
-    # ── peak hour flag (rush hours) ───────────────────────────────────────────
-    df["is_peak"] = df["hour"].isin([7, 8, 9, 16, 17, 18]).astype(int)
-
-    # ── time features ─────────────────────────────────────────────────────────
-    df["time_slot"] = make_time_slot(df)
-    df["time_sin"]  = np.sin(2 * math.pi * df["time_numeric"] / 24)
-    df["time_cos"]  = np.cos(2 * math.pi * df["time_numeric"] / 24)
-
-    global_mean = train_ref["speed_ratio"].mean()
-    agg_cols = [
-        "segment_mean_speed", "segment_std_speed",
-        "segment_min_speed", "segment_q10_speed",
-        "segment_congestion_rate", "segment_slow_rate",
-        "hist_seg_dow", "hist_seg_weekend", "hist_seg_hour",
-        "hist_seg_hour_std",
-        "seg_hour_cong_rate", "seg_hour_min", "seg_hour_q25",
-        "global_hour_mean", "global_dow_hour_mean",
-        "seg_vs_global_hour", "seg_vs_global_dow",
-        "seg_hour_vs_city_ratio", "road_capacity"
-    ]
-    for col in agg_cols:
-        if col not in df.columns:
-            df[col] = np.nan
-        df[col] = df[col].fillna(global_mean)
-
-    return df
+    return model
 
 
-FEATURE_COLS = [
-
-    "segment_mean_speed",
-    "segment_std_speed",
-    "segment_min_speed",
-    "segment_q10_speed",
-
-    "segment_congestion_rate",
-    "segment_slow_rate",
-
-    "seg_vs_global_hour",
-    "seg_vs_global_dow",
-    "seg_hour_vs_city_ratio",
-
-    "hist_seg_hour_std",
-
-    "seg_hour_cong_rate",
-    "seg_hour_min",
-    "seg_hour_q25",
-
-    "speed_limit",
-    "frc",
-    "distance",
-    "road_capacity",
-
-    "is_peak",
-
-    "time_slot",
-    "time_sin",
-    "time_cos",
-
-    "day_of_week_num",
-    "is_weekend",
-
-    "hist_seg_dow",
-    "hist_seg_weekend",
-    "hist_seg_hour",
-
-    "global_hour_mean",
-    "global_dow_hour_mean",
-
-    "sample_size"
-]
+def predict(model, X_test):
+    model.eval()
+    with torch.no_grad():
+        X = torch.tensor(X_test, dtype=torch.float32, device=DEVICE)
+        preds = torch.argmax(model(X), dim=1)
+    return preds.cpu().numpy()
 
 
-df = pd.read_csv(csv_path)
+df = load_dataset()
 
 print(
     f"Loaded {len(df):,} rows"
@@ -211,12 +88,6 @@ print(
 
 print(
     f"{df['date'].nunique()} days"
-)
-
-
-df["target"] = (
-    df["speed_ratio"]
-    .apply(ratio_to_label)
 )
 
 
@@ -263,13 +134,12 @@ for test_day in days:
     )
 
 
-    train = add_features(
-        train,
+    test = add_features(
+        test,
         train
     )
 
-    test = add_features(
-        test,
+    train = add_features_out_of_fold(
         train
     )
 
@@ -283,35 +153,22 @@ for test_day in days:
     y_test = test["target"]
 
 
-    model = Pipeline([
+    scaler = StandardScaler()
 
-        (
-            "scaler",
-            StandardScaler()
-        ),
-
-        (
-            "logistic_regression",
-            LogisticRegression(
-                solver="saga",
-                max_iter=500,
-                class_weight="balanced",
-                random_state=42
-            )
-        )
-
-    ])
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
 
 
-    model.fit(
-        X_train,
-        y_train
+    model = train_logistic_regression(
+        X_train_scaled,
+        y_train.to_numpy()
     )
 
 
 
-    preds = model.predict(
-        X_test
+    preds = predict(
+        model,
+        X_test_scaled
     )
 
 
@@ -353,17 +210,25 @@ for test_day in days:
         "macro_f1": f1_m
     })
 
-fold_results = pd.DataFrame({
-    "actual": y_test.to_numpy(),
-    "predicted": preds
-})
+    fold_results = pd.DataFrame({
+        "date": test["date"].to_numpy(),
+        "time_numeric": test["time_numeric"].to_numpy(),
+        "segment_id": test["segment_id"].to_numpy(),
+        "actual": y_test.to_numpy(),
+        "predicted": preds
+    })
 
-all_predictions.append(fold_results)
+    all_predictions.append(fold_results)
 
 
 results = pd.concat(
     all_predictions,
     ignore_index=True
+)
+
+results.to_parquet(
+    REPORT_DIR / "predictions_logistic_regression.parquet",
+    index=False
 )
 
 
