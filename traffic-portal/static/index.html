@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bucharest Traffic Portal</title>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="/static/styles.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">Traffic<span>Portal</span></div>
+  <div class="stats-bar">
+    <div class="stat-item"><strong id="statDates">—</strong> days</div>
+    <div class="stat-item"><strong id="statSegments">—</strong> segments</div>
+    <div class="stat-item"><strong id="statRows">—</strong> records</div>
+  </div>
+</div>
+
+<div class="controls">
+  <div class="control-group">
+    <label>Day</label>
+    <select id="dateSelect"></select>
+  </div>
+  <div class="separator"></div>
+  <div class="hour-control">
+    <label>Time</label>
+    <div class="hour-display" id="hourDisplay">08:00</div>
+    <input type="range" class="hour-slider" id="hourSlider" min="0" max="95" value="32" step="1">
+    <button class="play-btn" id="playBtn" title="Auto-play">
+      <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="6,4 20,12 6,20"/></svg>
+    </button>
+  </div>
+  <div class="separator"></div>
+  <div class="control-group">
+    <label>Streets</label>
+    <div class="street-filter" id="streetFilter">
+      <button type="button" class="street-trigger" id="streetTrigger" aria-haspopup="listbox" aria-expanded="false">
+        <span id="streetSummary">All streets</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="6 9 12 15 18 9"></polyline>
+        </svg>
+      </button>
+      <div class="street-dropdown" id="streetDropdown">
+        <div class="street-actions">
+          <button type="button" class="street-action-btn" id="streetClearBtn">Use all streets</button>
+        </div>
+        <div class="street-options" id="streetOptions"></div>
+      </div>
+      <div class="street-help">Pick one or more streets</div>
+    </div>
+  </div>
+</div>
+
+<div class="main">
+  <div class="map-container">
+    <div id="map"></div>
+    <div class="loading-overlay" id="mapLoading"><div class="spinner"></div></div>
+    <div class="map-legend">
+      <div class="legend-title">Traffic State</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:var(--free-flow)"></div> Free Flow</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:var(--slow)"></div> Slow</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:var(--congested)"></div> Congested</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:#C8C5BC"></div> No Data</div>
+    </div>
+  </div>
+
+  <div class="side-panel">
+    <div class="panel-section">
+      <div class="section-title">Day Overview — 15-Min Breakdown</div>
+      <div class="chart-container"><canvas id="overviewChart"></canvas></div>
+    </div>
+    <div class="panel-section">
+      <div class="section-title" id="hourSummaryTitle">Time Slot Summary</div>
+      <div class="state-summary">
+        <div class="state-card"><div class="value" style="color:var(--free-flow)" id="sumFree">—</div><div class="label">Free Flow</div></div>
+        <div class="state-card"><div class="value" style="color:var(--slow)" id="sumSlow">—</div><div class="label">Slow</div></div>
+        <div class="state-card"><div class="value" style="color:var(--congested)" id="sumCong">—</div><div class="label">Congested</div></div>
+      </div>
+    </div>
+    <div class="panel-section" id="segmentPanel">
+      <div class="section-title">Segment Detail</div>
+      <div class="empty-state" id="segmentEmpty">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <circle cx="12" cy="12" r="10"/><path d="M12 8v4m0 4h.01"/>
+        </svg>
+        <div>Click a segment on the map to see its full-day profile</div>
+      </div>
+      <div id="segmentDetail" style="display:none;">
+        <div class="segment-info">
+          <div class="street-name" id="segStreet"></div>
+          <div class="meta">
+            Segment <span id="segId"></span> · Speed limit <span id="segLimit"></span> km/h · FRC <span id="segFrc"></span> · <span id="segDist"></span>m · <span id="segObs"></span> obs
+          </div>
+        </div>
+        <div class="segment-chart-container"><canvas id="segmentChart"></canvas></div>
+        <div style="margin-top:12px;">
+          <div class="section-title">State at selected time</div>
+          <div id="segStateBreakdown"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+function slotToTime(slot) { return slot * 0.25; }
+function timeToSlot(t) { return Math.round(t / 0.25); }
+function timeToLabel(t) {
+  const h = Math.floor(t);
+  const m = Math.round((t - h) * 60);
+  return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}`;
+}
+
+const state = {
+  dates: [],
+  segments: {},
+  currentDate: null,
+  currentSlot: 32,
+  currentStreets: [],
+  streetList: [],
+  selectedSegment: null,
+  playing: false,
+  playInterval: null,
+  mapLayers: [],
+  highlightLayer: null,
+  dayCache: null,
+  dayCacheKey: null,
+};
+
+const map = L.map("map", {
+  center: [44.4268, 26.1025],
+  zoom: 13,
+  minZoom: 11,
+  maxZoom: 19,
+});
+L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", {
+  attribution: '&copy; <a href="https://carto.com/">CARTO</a>', maxZoom: 19,
+}).addTo(map);
+
+async function loadBoundary() {
+  try {
+    const data = await api("/static/bucharest_outline.geojson");
+    const polyFeature = data.features.find(f => f.geometry.type === "Polygon");
+    if (!polyFeature) return;
+
+    const ring = polyFeature.geometry.coordinates[0];
+    const latlngs = ring.map(c => [c[1], c[0]]);
+
+    const worldOuter = [
+      [90, -180], [90, 180], [-90, 180], [-90, -180], [90, -180]
+    ];
+    L.polygon([worldOuter, latlngs], {
+      color: "none",
+      fillColor: "#F8F7F4",
+      fillOpacity: 0.75,
+      interactive: false,
+    }).addTo(map);
+
+    L.polyline(latlngs, {
+      color: "#6B6960",
+      weight: 2,
+      opacity: 0.8,
+      dashArray: "6 4",
+      interactive: false,
+    }).addTo(map);
+
+    const bounds = L.latLngBounds(latlngs).pad(0.1);
+    map.setMaxBounds(bounds);
+  } catch (e) {
+    console.warn("Could not load boundary:", e);
+  }
+}
+loadBoundary();
+
+map.on("zoomend", () => {
+  const w = frcToWeight();
+  const o = zoomOpacity();
+  state.mapLayers.forEach(layer => {
+    if (layer.setStyle) {
+      layer.setStyle({ weight: w, opacity: o });
+    }
+  });
+  if (state.highlightLayer && state.selectedSegment) {
+    highlightSegment(state.selectedSegment);
+  }
+});
+
+const overviewLabels = Array.from({length: 96}, (_, i) => timeToLabel(i * 0.25));
+const overviewCtx = document.getElementById("overviewChart").getContext("2d");
+const overviewChart = new Chart(overviewCtx, {
+  type: "bar",
+  data: {
+    labels: overviewLabels,
+    datasets: [
+      { label: "Free Flow", data: [], backgroundColor: "#2D9C5A", stack: "s" },
+      { label: "Slow", data: [], backgroundColor: "#E8A817", stack: "s" },
+      { label: "Congested", data: [], backgroundColor: "#D4582A", stack: "s" },
+    ]
+  },
+  options: {
+    responsive: true, maintainAspectRatio: false,
+    plugins: {
+      legend: { display: false },
+      tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(1)}%` } }
+    },
+    scales: {
+      x: {
+        ticks: { font: { size: 8, family: "'Roboto Mono'" }, maxRotation: 0, autoSkip: true, maxTicksLimit: 12 },
+        grid: { display: false },
+      },
+      y: {
+        stacked: true, max: 100,
+        ticks: { font: { size: 10, family: "'Roboto Mono'" }, callback: v => v + "%" },
+        grid: { color: "#DDE3EA88" },
+      }
+    },
+    onClick: (evt, elements) => {
+      if (elements.length > 0) {
+        const idx = elements[0].index;
+        document.getElementById("hourSlider").value = idx;
+        state.currentSlot = idx;
+        updateTimeDisplay();
+        loadTraffic();
+      }
+    }
+  }
+});
+
+let segmentChart = null;
+
+const COLORS = { free_flow: "#2D9C5A", slow: "#E8A817", congested: "#D4582A", no_data: "#C8C5BC" };
+function stateColor(st) { return COLORS[st] || "#C8C5BC"; }
+
+function showLoading(show) {
+  document.getElementById("mapLoading").classList.toggle("active", show);
+}
+
+function updateTimeDisplay() {
+  document.getElementById("hourDisplay").textContent = timeToLabel(slotToTime(state.currentSlot));
+}
+
+async function api(path) { return (await fetch(path)).json(); }
+
+function frcToWeight() {
+  const zoom = map.getZoom();
+  const scale = Math.pow(2, (zoom - 13) * 0.7);
+  return Math.max(0.5, 2 * scale);
+}
+function zoomOpacity() {
+  const zoom = map.getZoom();
+  if (zoom >= 14) return 0.85;
+  if (zoom >= 13) return 0.7;
+  if (zoom >= 12) return 0.5;
+  return 0.35;
+}
+
+function parseGeometry(geomStr) {
+  if (!geomStr) return null;
+  try {
+    const geom = typeof geomStr === "string" ? JSON.parse(geomStr) : geomStr;
+    if (geom.type === "LineString" && geom.coordinates && geom.coordinates.length >= 2) {
+      return geom.coordinates.map(c => [c[1], c[0]]);
+    }
+    if (geom.type === "Point" && geom.coordinates) {
+      return [[geom.coordinates[1], geom.coordinates[0]]];
+    }
+  } catch (e) {}
+  return null;
+}
+
+async function init() {
+  showLoading(true);
+
+  const [stats, dates, streets, segments] = await Promise.all([
+    api("/api/stats"),
+    api("/api/dates"),
+    api("/api/streets"),
+    api("/api/segments"),
+  ]);
+
+  document.getElementById("statSegments").textContent = stats.segments.toLocaleString();
+  document.getElementById("statDates").textContent = stats.dates;
+  document.getElementById("statRows").textContent = stats.traffic_rows.toLocaleString();
+
+  segments.forEach(s => {
+    s.latlngs = parseGeometry(s.geometry);
+    state.segments[s.segment_id] = s;
+  });
+
+  state.dates = dates;
+  const dateSelect = document.getElementById("dateSelect");
+  dateSelect.innerHTML = dates.map(d =>
+    `<option value="${d.date}">${d.date} (${d.day_of_week})</option>`
+  ).join("");
+  state.currentDate = dates[0]?.date;
+
+  state.streetList = streets;
+  initStreetFilter(streets);
+
+  await Promise.all([loadOverview(), loadTraffic()]);
+  showLoading(false);
+}
+
+function initStreetFilter(streets) {
+  const filterEl = document.getElementById("streetFilter");
+  const triggerEl = document.getElementById("streetTrigger");
+  const dropdownEl = document.getElementById("streetDropdown");
+  const optionsEl = document.getElementById("streetOptions");
+  const clearBtnEl = document.getElementById("streetClearBtn");
+
+  optionsEl.innerHTML = "";
+  streets.forEach(street => {
+    const labelEl = document.createElement("label");
+    labelEl.className = "street-option";
+
+    const checkboxEl = document.createElement("input");
+    checkboxEl.type = "checkbox";
+    checkboxEl.value = street;
+
+    const textEl = document.createElement("span");
+    textEl.textContent = street;
+
+    labelEl.appendChild(checkboxEl);
+    labelEl.appendChild(textEl);
+    optionsEl.appendChild(labelEl);
+  });
+
+  const closeDropdown = () => {
+    filterEl.classList.remove("open");
+    triggerEl.setAttribute("aria-expanded", "false");
+  };
+
+  triggerEl.addEventListener("click", () => {
+    const nextOpen = !filterEl.classList.contains("open");
+    filterEl.classList.toggle("open", nextOpen);
+    triggerEl.setAttribute("aria-expanded", String(nextOpen));
+  });
+
+  document.addEventListener("click", (event) => {
+    if (!filterEl.contains(event.target)) closeDropdown();
+  });
+
+  optionsEl.addEventListener("change", () => {
+    state.currentStreets = Array.from(optionsEl.querySelectorAll("input:checked")).map(cb => cb.value);
+    applyStreetFilter();
+  });
+
+  clearBtnEl.addEventListener("click", () => {
+    optionsEl.querySelectorAll("input:checked").forEach(cb => {
+      cb.checked = false;
+    });
+    state.currentStreets = [];
+    applyStreetFilter();
+  });
+
+  updateStreetSummary();
+}
+
+function updateStreetSummary() {
+  const summaryEl = document.getElementById("streetSummary");
+  const selected = state.currentStreets;
+
+  if (!selected.length) {
+    summaryEl.textContent = "All streets";
+    return;
+  }
+
+  if (selected.length === 1) {
+    summaryEl.textContent = selected[0];
+    return;
+  }
+
+  if (selected.length === 2) {
+    summaryEl.textContent = `${selected[0]}, ${selected[1]}`;
+    return;
+  }
+
+  summaryEl.textContent = `${selected.length} streets selected`;
+}
+
+function applyStreetFilter() {
+  updateStreetSummary();
+  state.selectedSegment = null;
+  state.dayCacheKey = null;
+  document.getElementById("segmentEmpty").style.display = "";
+  document.getElementById("segmentDetail").style.display = "none";
+  Promise.all([loadOverview(), loadTraffic()]);
+}
+
+async function loadOverview() {
+  const params = new URLSearchParams({ date: state.currentDate });
+  appendStreetParams(params);
+
+  const data = await api(`/api/overview?${params}`);
+
+  const ff = Array(96).fill(0), sl = Array(96).fill(0), co = Array(96).fill(0);
+  data.forEach(d => {
+    const slot = timeToSlot(d.time_numeric);
+    ff[slot] = d.avg_free_flow || 0;
+    sl[slot] = d.avg_slow || 0;
+    co[slot] = d.avg_congested || 0;
+  });
+
+  overviewChart.data.datasets[0].data = ff;
+  overviewChart.data.datasets[1].data = sl;
+  overviewChart.data.datasets[2].data = co;
+  overviewChart.update("none");
+}
+
+function getDayCacheKey() {
+  const streetsKey = [...state.currentStreets].sort().join("|");
+  return `${state.currentDate}|${streetsKey}`;
+}
+
+async function loadTraffic() {
+  showLoading(true);
+
+  const timeVal = slotToTime(state.currentSlot);
+  const params = new URLSearchParams({ date: state.currentDate, time: timeVal });
+  appendStreetParams(params);
+
+  const data = await api(`/api/traffic?${params}`);
+  renderSlot(data);
+  showLoading(false);
+}
+
+async function prefetchDay() {
+  const key = getDayCacheKey();
+  if (state.dayCacheKey === key && state.dayCache) return;
+
+  showLoading(true);
+  const params = new URLSearchParams({ date: state.currentDate });
+  appendStreetParams(params);
+
+  const byTime = await api(`/api/traffic/day?${params}`);
+  state.dayCache = byTime;
+  state.dayCacheKey = key;
+  showLoading(false);
+}
+
+function appendStreetParams(params) {
+  state.currentStreets.forEach(street => params.append("street", street));
+}
+
+function renderSlot(data) {
+  state.mapLayers.forEach(l => map.removeLayer(l));
+  state.mapLayers = [];
+  if (state.highlightLayer) { map.removeLayer(state.highlightLayer); state.highlightLayer = null; }
+
+  let cntFree = 0, cntSlow = 0, cntCong = 0, total = 0;
+
+  data.forEach(d => {
+    const hasData = d.total_samples > 0;
+    const effectiveState = hasData ? d.traffic_state : "no_data";
+    const color = stateColor(effectiveState);
+    const segMeta = state.segments[d.segment_id];
+    const latlngs = segMeta?.latlngs;
+    const frc = segMeta?.frc || 4;
+
+    let layer;
+
+    if (latlngs && latlngs.length >= 2) {
+      layer = L.polyline(latlngs, {
+        color: color,
+        weight: frcToWeight(frc),
+        opacity: hasData ? 0.85 : 0.4,
+        lineCap: "round",
+        lineJoin: "round",
+      }).addTo(map);
+    } else {
+      layer = L.circleMarker([d.latitude, d.longitude], {
+        radius: 5, fillColor: color, color: color,
+        weight: 1, opacity: hasData ? 0.8 : 0.4, fillOpacity: hasData ? 0.7 : 0.3,
+      }).addTo(map);
+    }
+
+    layer._segId = d.segment_id;
+    layer._trafficData = d;
+    layer.on("click", () => selectSegment(d.segment_id));
+
+    layer.bindTooltip(
+      `<b>${d.street_name}</b><br>` +
+      (hasData
+        ? `State: ${d.traffic_state.replace(/_/g, " ")}<br>` +
+          `Speed ratio: ${d.speed_ratio?.toFixed(2) || "—"}<br>` +
+          `Speed: ${d.median_speed_val || "—"} km/h<br>` +
+          `Observations: ${d.total_samples}`
+        : `<i>No observations</i>`),
+      { direction: "top", sticky: true }
+    );
+
+    state.mapLayers.push(layer);
+
+    if (hasData) {
+      if (d.traffic_state === "free_flow") cntFree++;
+      else if (d.traffic_state === "slow") cntSlow++;
+      else if (d.traffic_state === "congested") cntCong++;
+      total++;
+    }
+  });
+
+  const timeLabel = timeToLabel(slotToTime(state.currentSlot));
+  document.getElementById("hourSummaryTitle").textContent =
+    `Time Slot Summary — ${timeLabel}`;
+
+  const pct = v => total ? (v / total * 100).toFixed(1) + "%" : "—";
+  document.getElementById("sumFree").textContent = pct(cntFree);
+  document.getElementById("sumSlow").textContent = pct(cntSlow);
+  document.getElementById("sumCong").textContent = pct(cntCong);
+
+  if (state.selectedSegment) highlightSegment(state.selectedSegment);
+  if (state.selectedSegment) loadSegmentDetail(state.selectedSegment);
+}
+
+function highlightSegment(segmentId) {
+  if (state.highlightLayer) { map.removeLayer(state.highlightLayer); state.highlightLayer = null; }
+
+  const segMeta = state.segments[segmentId];
+  if (!segMeta) return;
+
+  const latlngs = segMeta.latlngs;
+  if (latlngs && latlngs.length >= 2) {
+    state.highlightLayer = L.polyline(latlngs, {
+      color: "#FFFFFF",
+      weight: (frcToWeight(segMeta.frc || 4)) + 6,
+      opacity: 0.6,
+      lineCap: "round",
+      lineJoin: "round",
+      interactive: false,
+    }).addTo(map);
+    state.highlightLayer.bringToBack();
+  } else {
+    state.highlightLayer = L.circleMarker([segMeta.latitude, segMeta.longitude], {
+      radius: 12, fillColor: "#FFFFFF", color: "#1A1A18",
+      weight: 2, fillOpacity: 0.4, interactive: false,
+    }).addTo(map);
+  }
+}
+
+async function selectSegment(segmentId) {
+  state.selectedSegment = segmentId;
+  highlightSegment(segmentId);
+  await loadSegmentDetail(segmentId);
+}
+
+async function loadSegmentDetail(segmentId) {
+  const data = await api(`/api/traffic/segment/${segmentId}?date=${state.currentDate}`);
+  if (!data.length) return;
+
+  const meta = state.segments[segmentId] || data[0];
+
+  document.getElementById("segmentEmpty").style.display = "none";
+  document.getElementById("segmentDetail").style.display = "block";
+  document.getElementById("segStreet").textContent = meta.street_name;
+  document.getElementById("segId").textContent = segmentId;
+  document.getElementById("segLimit").textContent = meta.speed_limit;
+  document.getElementById("segFrc").textContent = meta.frc;
+  document.getElementById("segDist").textContent = meta.distance;
+
+  const totalObs = data.reduce((sum, d) => sum + (d.total_samples || 0), 0);
+  document.getElementById("segObs").textContent = totalObs.toLocaleString();
+
+  const ff = Array(96).fill(0), sl = Array(96).fill(0), co = Array(96).fill(0);
+  data.forEach(d => {
+    const slot = timeToSlot(d.time_numeric);
+    if (d.traffic_state === "free_flow") ff[slot] = 100;
+    else if (d.traffic_state === "slow") sl[slot] = 100;
+    else if (d.traffic_state === "congested") co[slot] = 100;
+  });
+
+  if (segmentChart) segmentChart.destroy();
+  const ctx = document.getElementById("segmentChart").getContext("2d");
+  segmentChart = new Chart(ctx, {
+    type: "bar",
+    data: {
+      labels: Array.from({length: 96}, (_, i) => timeToLabel(i * 0.25)),
+      datasets: [
+        { label: "Free Flow", data: ff, backgroundColor: "#2D9C5A", stack: "s" },
+        { label: "Slow", data: sl, backgroundColor: "#E8A817", stack: "s" },
+        { label: "Congested", data: co, backgroundColor: "#D4582A", stack: "s" },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: {
+          ticks: { font: { size: 7, family: "'Roboto Mono'" }, maxRotation: 0, autoSkip: true, maxTicksLimit: 12 },
+          grid: { display: false },
+        },
+        y: {
+          stacked: true, max: 100,
+          ticks: { display: false },
+          grid: { display: false },
+        }
+      }
+    }
+  });
+
+  const currentTime = slotToTime(state.currentSlot);
+  const slotData = data.find(d => d.time_numeric === currentTime);
+  const bkdn = document.getElementById("segStateBreakdown");
+  if (slotData && slotData.total_samples > 0) {
+    bkdn.innerHTML = `
+      <div class="state-bar-row">
+        <div class="state-bar-label">State</div>
+        <div style="font-weight:500; color:${stateColor(slotData.traffic_state)}">${slotData.traffic_state.replace(/_/g, " ")}</div>
+      </div>
+      <div class="state-bar-row">
+        <div class="state-bar-label">Speed ratio</div>
+        <div>${slotData.speed_ratio?.toFixed(2) || "—"}</div>
+      </div>
+      <div class="state-bar-row">
+        <div class="state-bar-label">Speed</div>
+        <div>${slotData.median_speed_val || "—"} km/h</div>
+      </div>
+      <div class="state-bar-row">
+        <div class="state-bar-label">Observations</div>
+        <div>${slotData.total_samples}</div>
+      </div>
+    `;
+  } else {
+    bkdn.innerHTML = '<div class="empty-state">No data for this time slot</div>';
+  }
+}
+
+document.getElementById("dateSelect").addEventListener("change", function() {
+  state.currentDate = this.value;
+  state.selectedSegment = null;
+  state.dayCacheKey = null;
+  document.getElementById("segmentEmpty").style.display = "";
+  document.getElementById("segmentDetail").style.display = "none";
+  Promise.all([loadOverview(), loadTraffic()]);
+});
+
+document.getElementById("hourSlider").addEventListener("input", function() {
+  state.currentSlot = parseInt(this.value);
+  updateTimeDisplay();
+});
+
+document.getElementById("hourSlider").addEventListener("change", function() {
+  state.currentSlot = parseInt(this.value);
+  updateTimeDisplay();
+  loadTraffic();
+});
+
+document.getElementById("playBtn").addEventListener("click", async function() {
+  if (state.playing) {
+    clearInterval(state.playInterval);
+    state.playing = false;
+    this.innerHTML = '<svg viewBox="0 0 24 24" fill="currentColor"><polygon points="6,4 20,12 6,20"/></svg>';
+  } else {
+    state.playing = true;
+    this.innerHTML = '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="4" width="4" height="16"/><rect x="15" y="4" width="4" height="16"/></svg>';
+
+    await prefetchDay();
+    if (!state.playing) return;
+
+    state.playInterval = setInterval(() => {
+      state.currentSlot = (state.currentSlot + 1) % 96;
+      document.getElementById("hourSlider").value = state.currentSlot;
+      updateTimeDisplay();
+
+      const timeVal = slotToTime(state.currentSlot);
+      const timeKey = Number.isInteger(timeVal) ? timeVal.toFixed(1) : String(timeVal);
+      const slotData = state.dayCache[timeKey] || [];
+      renderSlot(slotData);
+    }, 500);
+  }
+});
+
+init();
+</script>
+</body>
+</html>
